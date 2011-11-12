@@ -102,14 +102,19 @@ class _PollingMixin(object):
         pollable and either wait for more I/O or callback or errback the
         C{Deferred} returned earlier if the polling cycle has been completed.
         """
-        # This might be called without poll() being called earlier, for
-        # instance when a NOTIFY event is received
+        # This method often gets called from the reactor's doRead/doWrite
+        # handlers. Don't callback or errback the polling Deferred here, as
+        # arbitrary user code can be run by that and we don't want to deal with
+        # reentrancy issues if this user code tries running queries. The
+        # polling Deferred might also be simply not present, if we got called
+        # from a doRead after receiving a NOTIFY event.
+
         try:
             state = self.pollable().poll()
         except:
             if self._pollingD:
                 d, self._pollingD = self._pollingD, None
-                d.errback()
+                self.reactor.callLater(0, d.errback, failure.Failure())
             else:
                 # no one to report the error to
                 raise
@@ -117,7 +122,7 @@ class _PollingMixin(object):
             if state == psycopg2.extensions.POLL_OK:
                 if self._pollingD:
                     d, self._pollingD = self._pollingD, None
-                    d.callback(self)
+                    self.reactor.callLater(0, d.callback, self)
             elif state == psycopg2.extensions.POLL_WRITE:
                 self.reactor.addWriter(self)
             elif state == psycopg2.extensions.POLL_READ:
@@ -125,7 +130,7 @@ class _PollingMixin(object):
             else:
                 if self._pollingD:
                     d, self._pollingD = self._pollingD, None
-                    d.errback(UnexpectedPollResult())
+                    self.reactor.callLater(0, d.errback, UnexpectedPollResult())
                 else:
                     # no one to report the error to
                     raise UnexpectedPollResult()
@@ -550,12 +555,29 @@ class Connection(_PollingMixin):
         # a reader to a closed connection would be an error.
         if not self._connection.closed:
             self.reactor.addReader(self)
+            # While cursor was running, some notifies could have been
+            # delivered, so check for them.
+            self.checkForNotifies()
 
     def doRead(self):
         # call superclass to handle the pending read event on the socket
         _PollingMixin.doRead(self)
 
         # check for NOTIFY events
+        self.checkForNotifies()
+
+        # continue watching for NOTIFY events, but be careful to check the
+        # connection state in case one of the notify handler function caused a
+        # disconnection
+        if not self._connection.closed:
+            self.reactor.addReader(self)
+
+    def checkForNotifies(self):
+        """
+        Check if NOTIFY events have been received and if so, dispatch them to
+        the registered observers. This is done automatically, user code should
+        never need to call this method.
+        """
         while self._connection.notifies:
             notify = self._connection.notifies.pop()
             # don't iterate over self._notifyObservers directly because the
@@ -569,12 +591,6 @@ class Connection(_PollingMixin):
                     observer(notify)
                 except:
                     log.err()
-
-        # continue watching for NOTIFY events, but be careful to check the
-        # connection state in case one of the notify handler function caused a
-        # disconnection
-        if not self._connection.closed:
-            self.reactor.addReader(self)
 
     def addNotifyObserver(self, observer):
         """
