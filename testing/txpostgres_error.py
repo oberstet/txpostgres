@@ -1,3 +1,9 @@
+#from txkqreactor import kqreactor
+#kqreactor.install()
+
+#from twisted.internet import pollreactor
+#pollreactor.install()
+
 from twisted.internet import reactor
 from txpostgres.txpostgres import ConnectionPool, Connection
 
@@ -32,6 +38,8 @@ d = conn.connect(host = options.host,
                  password = options.password)
 d.addCallbacks(lambda _: conn.runQuery("select * from nonexistent"), failed)
 d.addCallbacks(success, failed)
+d.addErrback(lambda _: conn.close())
 d.addBoth(lambda _: reactor.stop())
 
+print "reactor class", reactor.__class__
 reactor.run()
